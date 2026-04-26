@@ -82,8 +82,7 @@ function initDrag() {
 
 // ── 文本提取与分段 ────────────────────────────────
 function extractPageText() {
-  const raw = (document.body.innerText || '').replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
-  return raw.length > 5000 ? raw.slice(0, 5000) : raw;
+  return (document.body.innerText || '').replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
 function segmentText(text) {
