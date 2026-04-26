@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "豆包 TTS",
+  "version": "1.0",
+  "description": "一键朗读当前网页内容,基于豆包流式 TTS",
+  "permissions": ["cookies", "storage"],
+  "host_permissions": [
+    "https://*.doubao.com/*",
+    "wss://ws-samantha.doubao.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "豆包 TTS · 朗读本页"
+  }
+}
