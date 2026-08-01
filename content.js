@@ -19,6 +19,51 @@ let wsClosed = false;
 let segmentTotal = 0;
 let segmentSent = 0;
 let sentenceCount = 0;
+// 解码+调度串行链:保证句子严格按到达顺序上时间轴,消除乱序竞态
+let scheduleChain = Promise.resolve();
+// 背压:纯内存兜底门限(防个别 60s+ 超长句撑爆内存)。
+// 注意:此门限不能压太低!发送停滞过久服务端会判会话空闲,主动 finish+close。
+// 主力背压靠下面的段数窗口,保证文本持续涓流、连接不饿死
+const SEND_AHEAD_SECONDS = 120;
+// 背压(段数):已发送但未播完的段数上限;50 段 ≈ 数分钟音频 ≈ 20-30MB 解码缓冲,有界
+const SEND_AHEAD_SEGMENTS = 50;
+// 涓流心跳:每 10s 强制补发 1 段,防止超长句播放期间发送空窗饿死连接
+const TRICKLE_INTERVAL_MS = 10000;
+let trickleTimer = null;
+let sendIndex = 0;
+let sentencesPlayed = 0;
+let finishSent = false;
+let synthFinished = false; // 服务端 'finish' 事件:全部合成完毕(服务端可能不断开 WS)
+// 会话代际:stop→start/续播时递增,旧会话迟到的 close/binary 事件一律丢弃,
+// 否则旧 close(1000) 会把新会话 wsClosed 置真,pump 永久停摆。
+// all_frames 下同 tab 多 frame 共享 callerTabId 路由,sessionId 必须带 frame 唯一前缀,
+// 否则两个 frame 各自的 sid=1 会互相串台
+const FRAME_UID = Math.random().toString(36).slice(2) + Date.now().toString(36);
+let sessionSeq = 0;
+let sessionId = null;
+// 服务端对单会话文本量/时长有限制,可能中途关 WS;自动续连从断点接着发。
+// 收到新会话的 sentence/binary 说明续连成功,计数清零;连续失败才封顶
+let reconnects = 0;
+const MAX_RECONNECTS = 8;
+// 续连后首个 open 必须立即补发文本(空会话会被服务端秒关),
+// 此时播放缓冲通常 > 门限,需绕过缓冲门限强制发一批
+let reconnectKick = 0;
+let reconnectTimer = null;
+// WS open 看门狗:TTS_OPEN 后长时间没收到 open 事件(代理页异常/消息丢失)时给出可见提示
+let wsOpened = false;
+let openWatchdog = null;
+
+function armOpenWatchdog() {
+  clearTimeout(openWatchdog);
+  const sid = sessionId;
+  openWatchdog = setTimeout(() => {
+    if (isReading && sessionId === sid && !wsOpened) {
+      // 代理页孤儿化/消息丢失时不死等,按断连自动续连自愈
+      setStatus('连接超时,自动续连...', '#f39c12');
+      scheduleReconnect();
+    }
+  }, 12000);
+}
 
 function injectPanel() {
   if (document.getElementById('tts-ext-panel')) return;
@@ -81,16 +126,93 @@ function initDrag() {
 }
 
 // ── 文本提取与分段 ────────────────────────────────
+function cleanText(s) {
+  return (s || '').replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
 function extractPageText() {
-  return (document.body.innerText || '').replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  return cleanText(document.body.innerText);
+}
+
+// 穿透 open shadow root 找选区:markdown 预览等插件常用 shadow DOM 渲染正文,
+// window.getSelection() 穿不透 shadow 边界,需沿 activeElement 链下钻
+function deepGetSelection() {
+  const sel = window.getSelection();
+  if (sel && !sel.isCollapsed && sel.rangeCount) return sel;
+  let el = document.activeElement;
+  while (el && el.shadowRoot) {
+    const s = el.shadowRoot.getSelection && el.shadowRoot.getSelection();
+    if (s && !s.isCollapsed && s.rangeCount) return s;
+    el = el.shadowRoot.activeElement;
+  }
+  return null;
+}
+
+// 忽略一切空白字符,在 haystack 中定位 needle,返回原文起始下标(找不到返回 -1)。
+// selectionText 与 innerText 的空白/换行常有差异,按"去空白串 + 下标映射"对齐
+function indexOfNormalized(haystack, needle) {
+  const map = []; // 去空白串下标 -> 原文下标
+  let stripped = '';
+  for (let i = 0; i < haystack.length; i++) {
+    if (!/\s/.test(haystack[i])) { map.push(i); stripped += haystack[i]; }
+  }
+  const k = stripped.indexOf((needle || '').replace(/\s+/g, ''));
+  return k < 0 ? -1 : map[k];
+}
+
+// 断点续播:取选区起点到页面末尾的全部文本。
+// 主路径:活选区 Range 精确定位(不做字符串匹配);
+// 兜底:选区被预览插件重渲染销毁时,用右键点击瞬间捕获的 selectionText 在全文归一化匹配。
+// 注意不能直接用 Range.toString():body 尾部常带内联 script/style,会被读出来,
+// 故 cloneContents + 剔除脚本样式 + 离屏 innerText。
+function extractFromSelection(fallbackText) {
+  const sel = deepGetSelection();
+  if (sel) {
+    const r = sel.getRangeAt(0);
+    if (r.startContainer.isConnected) {
+      const rest = document.createRange();
+      const rootNode = r.startContainer.getRootNode();
+      // 选区在 shadow tree 里时,Range 两端必须同属一个 node tree,读到 shadow 根末尾
+      rest.selectNodeContents(rootNode instanceof ShadowRoot ? rootNode : document.body);
+      rest.setStart(r.startContainer, r.startOffset);
+      const frag = rest.cloneContents();
+      frag.querySelectorAll('script,style,noscript,template').forEach(n => n.remove());
+      const host = document.createElement('div');
+      host.style.cssText = 'position:fixed;left:-9999px;top:0;visibility:hidden;';
+      host.appendChild(frag);
+      document.body.appendChild(host);
+      const text = cleanText(host.innerText);
+      host.remove();
+      if (text) return text;
+    }
+  }
+  if (fallbackText) {
+    const full = extractPageText();
+    const pos = indexOfNormalized(full, fallbackText);
+    if (pos >= 0) {
+      console.log('[TTS] 活选区不可用,用 selectionText 兜底定位,起点下标:', pos);
+      return full.slice(pos);
+    }
+  }
+  return null;
 }
 
 function segmentText(text) {
-  const segs = text.match(/[^。!?！？\n]+[。!?！？\n]?/g) || [text];
+  // 分号/冒号也切开:长段落单段播放可超 60s,既触发服务端空闲/限量判定又撑大解码缓冲
+  const segs = text.match(/[^。!?！？;；:\n]+[。!?！？;；:\n]?/g) || [text];
   return segs.map(s => s.trim()).filter(Boolean);
 }
 
 // ── 朗读流程 ─────────────────────────────────────
+// 右键菜单启动不算页面手势,AudioContext 可能被 autoplay 策略挂起;补一次真实点击即恢复
+if (!IS_DOUBAO) {
+  document.addEventListener('click', () => {
+    if (audioCtx && audioCtx.state === 'suspended' && isReading && !isPaused) {
+      audioCtx.resume().catch(() => {});
+    }
+  });
+}
+
 function toggleRead() {
   if (!isReading) startRead();
   else if (isPaused) resumeRead();
@@ -112,6 +234,7 @@ function resumeRead() {
     isPaused = false;
     setBtn('⏸ 暂停', '#2c3e50');
     setStatus('继续播放', '#27ae60');
+    maybeFinish(); // 暂停期间队列可能已播完且服务端已 finish,恢复时补收尾
   }).catch(() => {});
 }
 
@@ -129,8 +252,8 @@ function setBtn(label, color) {
   }
 }
 
-function startRead() {
-  const text = extractPageText();
+function startRead(text) {
+  if (!text) text = extractPageText();
   if (!text) { setStatus('页面无文本', '#e74c3c'); return; }
   const segs = segmentText(text);
   if (!segs.length) { setStatus('分段失败', '#e74c3c'); return; }
@@ -143,10 +266,18 @@ function startRead() {
   sentenceCount = 0;
   segmentTotal = segs.length;
   segmentSent = 0;
+  sendIndex = 0;
+  sentencesPlayed = 0;
+  finishSent = false;
+  synthFinished = false;
+  scheduleChain = Promise.resolve();
+  reconnects = 0;
+  sessionSeq += 1;
+  sessionId = FRAME_UID + ':' + sessionSeq;
 
   // AudioContext 必须在 user gesture 内创建/恢复才能播
   if (!audioCtx || audioCtx.state === 'closed') audioCtx = new AudioContext();
-  if (audioCtx.state === 'suspended') audioCtx.resume();
+  if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
   nextStartTime = audioCtx.currentTime;
 
   setBtn('⏸ 暂停', '#2c3e50');
@@ -155,34 +286,56 @@ function startRead() {
   document.getElementById('tts-ext-progress').textContent = '';
 
   pendingSegments = segs;
-  chrome.runtime.sendMessage({ type: 'TTS_OPEN' });
+  wsOpened = false;
+  armOpenWatchdog();
+  clearInterval(trickleTimer);
+  trickleTimer = setInterval(() => pumpSegments(1), TRICKLE_INTERVAL_MS);
+  chrome.runtime.sendMessage({ type: 'TTS_OPEN', sessionId });
 }
 
 let pendingSegments = [];
 
-function flushSegments() {
-  // WS open 后,逐段发送,中间留 30ms 间隔便于服务端流式接收
-  let i = 0;
-  const tick = () => {
-    if (!isReading) return;
-    if (i >= pendingSegments.length) {
-      chrome.runtime.sendMessage({ type: 'TTS_FINISH' });
-      setStatus(`已发送 ${pendingSegments.length} 段,等待合成...`, '#3498db');
-      return;
-    }
-    const seg = pendingSegments[i++];
-    segmentSent = i;
-    chrome.runtime.sendMessage({ type: 'TTS_SEND_TEXT', text: seg });
-    document.getElementById('tts-ext-progress').textContent = `发送 ${i}/${segmentTotal}`;
-    setTimeout(tick, 30);
-  };
-  tick();
+function bufferedAhead() {
+  if (!audioCtx || audioCtx.state === 'closed') return 0;
+  return Math.max(0, nextStartTime - audioCtx.currentTime);
+}
+
+// 背压发送:缓冲超 SEND_AHEAD_SECONDS 或未播段数超 SEND_AHEAD_SEGMENTS 即暂停;
+// 由 open / 每句调度完成 / 每段播放结束(onended) / 10s 涓流心跳驱动。
+// forceCount:续连后的首个 open 需绕过缓冲门限强制补发的段数(空会话会被服务端秒关)。
+// 必须等 wsOpened:WS 未就绪时发送会被代理层静默丢弃,但 sendIndex 已前移,句子永久丢失
+function pumpSegments(forceCount = 0) {
+  if (!isReading || wsClosed || !wsOpened) return;
+  while (sendIndex < pendingSegments.length
+         && sendIndex - sentencesPlayed < SEND_AHEAD_SEGMENTS
+         && (forceCount > 0 || bufferedAhead() <= SEND_AHEAD_SECONDS)) {
+    const seg = pendingSegments[sendIndex++];
+    segmentSent = sendIndex;
+    chrome.runtime.sendMessage({ type: 'TTS_SEND_TEXT', text: seg, sessionId });
+    if (forceCount > 0) forceCount--;
+  }
+  document.getElementById('tts-ext-progress').textContent = `发送 ${sendIndex}/${segmentTotal}`;
+  if (sendIndex >= pendingSegments.length && !finishSent) {
+    finishSent = true;
+    chrome.runtime.sendMessage({ type: 'TTS_FINISH', sessionId });
+    setStatus(`已发送 ${pendingSegments.length} 段,等待合成...`, '#3498db');
+  }
 }
 
 function stopRead() {
   isReading = false;
   isPaused = false;
+  clearTimeout(reconnectTimer);
+  clearTimeout(openWatchdog);
+  clearInterval(trickleTimer);
+  reconnectKick = 0;
   pendingSegments = [];
+  sendIndex = 0;
+  sentencesPlayed = 0;
+  finishSent = false;
+  synthFinished = false;
+  scheduleChain = Promise.resolve();
+  reconnects = 0;
   currentChunks = [];
   activeSources.forEach(s => { try { s.stop(); } catch (e) {} });
   activeSources = [];
@@ -191,7 +344,7 @@ function stopRead() {
     audioCtx = null;
   }
   nextStartTime = 0;
-  chrome.runtime.sendMessage({ type: 'TTS_CLOSE' });
+  chrome.runtime.sendMessage({ type: 'TTS_CLOSE', sessionId });
   setBtn('▶ 朗读本页');
   setStopVisible(false);
   setStatus('已停止', '#555');
@@ -199,32 +352,98 @@ function stopRead() {
 }
 
 // ── 音频调度播放(AudioContext 时间轴,无缝拼接)─────
-async function flushCurrentSentence() {
+// 关键:decodeAudioData 耗时不定,若并发 decode 则先完成者先占 nextStartTime,
+// 造成乱序(C 先于 B)。用 scheduleChain 串行化,保证严格按句子到达顺序上时间轴。
+function maybeFinish() {
+  // isReading=false 说明是异常断开/手动停止,保留原状态文案,不覆盖为"播放完成"
+  if (!isReading || isPaused) return;
+  // 文本没发完绝不可能是完成态:服务端可能对单会话限量,中途发 finish+close
+  if (!finishSent) return;
+  if (!wsClosed && !synthFinished) return;
+  if (activeSources.length > 0) return;
+  isReading = false;
+  isPaused = false;
+  clearInterval(trickleTimer);
+  setBtn('▶ 朗读本页');
+  setStopVisible(false);
+  setStatus('播放完成', '#27ae60');
+}
+
+function flushCurrentSentence() {
   if (currentChunks.length === 0) return;
   const chunks = currentChunks;
   currentChunks = [];
   sentenceCount++;
+  scheduleChain = scheduleChain.then(() => scheduleChunks(chunks)).catch(() => {});
+}
 
-  if (!audioCtx || audioCtx.state === 'closed') return;
-  if (audioCtx.state === 'suspended' && !isPaused) {
-    try { await audioCtx.resume(); } catch (e) {}
+// 文本没发完连接就断了(或服务端提前 finish):服务端单会话限量/空闲判定,
+// 自动续连从断点接着发(缓冲队列跨会话连续)。旧 WS 由新 PROXY_TTS_OPEN 顺带关闭
+function scheduleReconnect() {
+  if (reconnects >= MAX_RECONNECTS) {
+    isReading = false;
+    isPaused = false;
+    clearInterval(trickleTimer);
+    setBtn('▶ 朗读本页');
+    setStopVisible(false);
+    setStatus(`服务端连续限量断开,续连失败 (${sendIndex}/${segmentTotal})`, '#e74c3c');
+    return;
+  }
+  reconnects++;
+  wsClosed = false;
+  wsOpened = false; // 旧会话已放弃:退避期间禁止任何发送(trickle 会每 10s 尝试)
+  finishSent = false;
+  synthFinished = false;
+  // 回退发送指针到"已完整收到音频"的位置:已发送但音频未流完的句子必须重发,
+  // 否则每次限量断连漏读几句(宁可个别句重复,不可漏)
+  sendIndex = Math.min(sendIndex, sentenceCount);
+  sessionSeq += 1;
+  sessionId = FRAME_UID + ':' + sessionSeq;
+  // 退避:避免触发服务端频率限制,也给播放缓冲留出消耗时间
+  const delay = Math.min(800 * reconnects, 5000);
+  reconnectKick = 10; // 续连后首个 open 强制补发 10 段,绕过缓冲门限
+  setStatus(`服务端限量断开,${(delay / 1000).toFixed(1)}s 后续连 (${reconnects}) 从 ${sendIndex}/${segmentTotal} 继续...`, '#f39c12');
+  const sid = sessionId;
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    if (!isReading || sessionId !== sid) return;
+    wsOpened = false;
+    armOpenWatchdog();
+    chrome.runtime.sendMessage({ type: 'TTS_OPEN', sessionId });
+  }, delay);
+}
+
+async function scheduleChunks(chunks) {
+  // 捕获当前会话的 ctx:停止→重开后,旧链上的 in-flight decode 不得排进新会话
+  const ctx = audioCtx;
+  if (!ctx || ctx.state === 'closed') return;
+  if (ctx.state === 'suspended' && !isPaused) {
+    try { await ctx.resume(); } catch (e) {}
   }
 
   const blob = new Blob(chunks.map(a => new Uint8Array(a)), { type: 'audio/aac' });
   let buf;
   try {
-    buf = await audioCtx.decodeAudioData(await blob.arrayBuffer());
+    buf = await ctx.decodeAudioData(await blob.arrayBuffer());
   } catch (e) {
     console.error('[TTS decode error]', e);
+    // 该句永不播放,必须计入"已消耗",否则未播段数门限把发送卡死;
+    // 但仅当仍属当前会话:stop→start 跨 await 时旧会话的失败不得虚增新会话计数
+    if (ctx === audioCtx && isReading) {
+      sentencesPlayed++;
+      pumpSegments();
+    }
     return;
   }
+  // await 之后会话可能已切换/停止
+  if (ctx !== audioCtx || ctx.state === 'closed' || !isReading) return;
 
-  const src = audioCtx.createBufferSource();
+  const src = ctx.createBufferSource();
   src.buffer = buf;
-  src.connect(audioCtx.destination);
+  src.connect(ctx.destination);
 
   // 关键:如果 nextStartTime 已经过去,从 currentTime 起播;否则接续上一段尾巴
-  const startAt = Math.max(nextStartTime, audioCtx.currentTime + 0.02);
+  const startAt = Math.max(nextStartTime, ctx.currentTime + 0.02);
   src.start(startAt);
   nextStartTime = startAt + buf.duration;
 
@@ -232,22 +451,22 @@ async function flushCurrentSentence() {
   src.onended = () => {
     const i = activeSources.indexOf(src);
     if (i >= 0) activeSources.splice(i, 1);
-    if (activeSources.length === 0 && wsClosed) {
-      isReading = false;
-      isPaused = false;
-      setBtn('▶ 朗读本页');
-      setStopVisible(false);
-      setStatus('播放完成', '#27ae60');
-    }
+    sentencesPlayed++;
+    pumpSegments(); // 播放消耗了缓冲,继续送文本
+    maybeFinish();
   };
 
   document.getElementById('tts-ext-progress').textContent =
-    `合成 ${sentenceCount} 句 · 排队 ${activeSources.length} · 缓冲 ${(nextStartTime - audioCtx.currentTime).toFixed(2)}s`;
+    `合成 ${sentenceCount} 句 · 排队 ${activeSources.length} · 缓冲 ${bufferedAhead().toFixed(2)}s`;
+
+  pumpSegments(); // 缓冲未满则继续送文本(首次合成前触发全量发送的起点)
 }
 
 // ── 接收 background 转发的 TTS 事件 ───────────────
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type !== 'TTS_EVENT') return;
+  // 代际过滤:旧会话迟到的 close/binary/message 全部丢弃
+  if (msg.sessionId !== sessionId) return;
 
   if (msg.event === 'no_doubao_tab') {
     setStatus('请先打开豆包页面 →', '#e74c3c');
@@ -257,8 +476,12 @@ chrome.runtime.onMessage.addListener((msg) => {
   }
 
   if (msg.event === 'open') {
+    wsOpened = true;
+    clearTimeout(openWatchdog);
     setStatus('已连接,开始送文本...', '#27ae60');
-    flushSegments();
+    const kick = reconnectKick;
+    reconnectKick = 0;
+    pumpSegments(kick);
     return;
   }
 
@@ -270,14 +493,23 @@ chrome.runtime.onMessage.addListener((msg) => {
     if (payload.event === 'open_success') {
       // 服务端 ack,不做特别处理
     } else if (payload.event === 'sentence_start') {
+      reconnects = 0; // 新会话正常出活,续连计数清零
       const txt = payload.sentence_start_result?.readable_text || '';
       setStatus(`合成中: ${txt.slice(0, 40)}`, '#3498db');
     } else if (payload.event === 'sentence_end') {
       flushCurrentSentence();
     } else if (payload.event === 'finish') {
       flushCurrentSentence();
+      synthFinished = true;
+      // 文本没发完服务端就 finish:等同提前断连,直接续连(不等 close,可能不来)
+      if (sendIndex < pendingSegments.length) {
+        console.log('[TTS] 服务端提前 finish,按断连续连处理, sent:', sendIndex, '/', segmentTotal);
+        scheduleReconnect();
+        return;
+      }
       setStatus('全部合成完成', '#27ae60');
-      // 不主动 close,让队列自然播完
+      // 调度链排空后若已无排队音频,立即收尾(服务端可能不关 WS)
+      scheduleChain.then(maybeFinish);
     } else if (payload.code && payload.code !== 0) {
       setStatus(`服务端错误 ${payload.code}: ${payload.message || ''}`, '#e74c3c');
     }
@@ -285,6 +517,7 @@ chrome.runtime.onMessage.addListener((msg) => {
   }
 
   if (msg.event === 'binary') {
+    reconnects = 0; // 新会话正常出流,续连计数清零
     currentChunks.push(msg.data);
     console.log('[TTS binary]', msg.data.length, 'bytes, sentence chunks:', currentChunks.length);
     return;
@@ -297,18 +530,26 @@ chrome.runtime.onMessage.addListener((msg) => {
   }
 
   if (msg.event === 'close') {
+    console.log('[TTS close] code:', msg.code, 'sent:', sendIndex, '/', segmentTotal, 'played sentences:', sentenceCount);
     flushCurrentSentence();
     wsClosed = true;
+    wsOpened = false;
+
+    // 文本没发完连接就断了:自动续连从断点接着发
+    if (isReading && sendIndex < pendingSegments.length) {
+      scheduleReconnect();
+      return;
+    }
+
     if (msg.code === 1000) {
-      // 正常关闭:让 onended 在队列播完后收尾
-      if (activeSources.length === 0 && !isPaused) {
-        isReading = false;
-        setBtn('▶ 朗读本页');
-        setStopVisible(false);
-        setStatus('播放完成', '#27ae60');
-      } else {
-        setStatus('播放队列中...', '#555');
-      }
+      // 正常关闭:等调度链排空后再判断,否则 in-flight 的 decode 会被误判为"已播完"
+      scheduleChain.then(() => {
+        if (activeSources.length === 0 && !isPaused) {
+          maybeFinish();
+        } else {
+          setStatus('播放队列中...', '#555');
+        }
+      });
     } else {
       isReading = false;
       isPaused = false;
@@ -323,14 +564,32 @@ chrome.runtime.onMessage.addListener((msg) => {
 // ── 图标点击切换浮窗 ─────────────────────────────
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'PING') { sendResponse({ ok: true }); return true; }
+  if (IS_DOUBAO) return; // 豆包页只做代理,不显示朗读 UI
   if (msg.type === 'TOGGLE_PANEL') {
-    if (IS_DOUBAO) return; // 豆包页只做代理,不显示朗读 UI
+    if (window !== top) return; // 浮窗只放顶层 frame
     const panel = document.getElementById('tts-ext-panel');
     if (panel) {
       if (panel.style.display === 'none') panel.style.display = '';
       else { stopRead(); panel.style.display = 'none'; }
     } else {
       injectPanel();
+    }
+  }
+  if (msg.type === 'PLAY_FROM_SELECTION') {
+    // 消息广播到所有 frame:先取选区,只有选区所在 frame 继续,其余静默忽略
+    // (markdown 预览等插件常把正文渲染在 iframe/shadow DOM 里,顶层 frame 拿不到选区)
+    const text = extractFromSelection(msg.selectionText);
+    console.log('[TTS] PLAY_FROM_SELECTION frame:', location.href,
+      '| top:', window === top, '| selectionText:', (msg.selectionText || '').length,
+      '| text:', text ? text.length + ' chars' : 'none');
+    if (!text) return;
+    let panel = document.getElementById('tts-ext-panel');
+    if (!panel) injectPanel();
+    else if (panel.style.display === 'none') panel.style.display = '';
+    if (isReading) stopRead();
+    startRead(text);
+    if (audioCtx && audioCtx.state === 'suspended') {
+      setStatus('已就绪,点击页面任意处开始发声', '#f39c12');
     }
   }
 });
@@ -345,63 +604,66 @@ const TTS_URL = 'wss://ws-samantha.doubao.com/samantha/audio/tts'
   + '&web_id=7627108056602248710&tea_uuid=7627108056602248710'
   + '&region=&sys_region=&samantha_web=1&use-olympus-account=1';
 
-const proxySessions = {}; // callerTabId -> WebSocket
+const proxySessions = {}; // callerTabId -> { ws, sessionId }
 
 function arrayBufferToArray(buf) {
   return Array.from(new Uint8Array(buf));
 }
 
-if (IS_DOUBAO) {
+// all_frames 下代理监听只挂顶层 frame,否则消息广播会让每个 iframe 各建一条 WS
+if (IS_DOUBAO && window === top) {
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg.type === 'PROXY_TTS_OPEN') {
-      const { callerTabId } = msg;
-      if (proxySessions[callerTabId]) {
-        try { proxySessions[callerTabId].close(); } catch (e) {}
+      const { callerTabId, sessionId } = msg;
+      const old = proxySessions[callerTabId];
+      if (old) {
+        try { old.ws.close(); } catch (e) {}
         delete proxySessions[callerTabId];
       }
       const ws = new WebSocket(TTS_URL);
       ws.binaryType = 'arraybuffer';
-      proxySessions[callerTabId] = ws;
+      proxySessions[callerTabId] = { ws, sessionId };
+      const emit = (event, extra = {}) =>
+        chrome.runtime.sendMessage({ type: 'PROXY_TTS_EVENT', callerTabId, sessionId, event, ...extra });
 
-      ws.onopen = () => chrome.runtime.sendMessage({ type: 'PROXY_TTS_EVENT', callerTabId, event: 'open' });
+      ws.onopen = () => emit('open');
       ws.onclose = (e) => {
-        chrome.runtime.sendMessage({ type: 'PROXY_TTS_EVENT', callerTabId, event: 'close', code: e.code });
-        delete proxySessions[callerTabId];
+        console.log('[TTS proxy] ws closed, code:', e.code, 'reason:', e.reason, 'wasClean:', e.wasClean);
+        emit('close', { code: e.code });
+        // 旧 ws 的 onclose 可能晚于新会话建立,只删自己,不误删新会话
+        if (proxySessions[callerTabId]?.ws === ws) delete proxySessions[callerTabId];
       };
-      ws.onerror = () => chrome.runtime.sendMessage({ type: 'PROXY_TTS_EVENT', callerTabId, event: 'error' });
+      ws.onerror = () => emit('error');
       ws.onmessage = (e) => {
         if (typeof e.data === 'string') {
-          chrome.runtime.sendMessage({ type: 'PROXY_TTS_EVENT', callerTabId, event: 'message', data: e.data });
+          emit('message', { data: e.data });
         } else {
           // ArrayBuffer 二进制 AAC 帧
-          chrome.runtime.sendMessage({
-            type: 'PROXY_TTS_EVENT',
-            callerTabId,
-            event: 'binary',
-            data: arrayBufferToArray(e.data)
-          });
+          emit('binary', { data: arrayBufferToArray(e.data) });
         }
       };
     }
 
     if (msg.type === 'PROXY_TTS_SEND_TEXT') {
-      const ws = proxySessions[msg.callerTabId];
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ event: 'text', text: msg.text }));
+      const s = proxySessions[msg.callerTabId];
+      if (s && s.sessionId === msg.sessionId && s.ws.readyState === WebSocket.OPEN) {
+        s.ws.send(JSON.stringify({ event: 'text', text: msg.text }));
       }
     }
 
     if (msg.type === 'PROXY_TTS_FINISH') {
-      const ws = proxySessions[msg.callerTabId];
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ event: 'finish' }));
+      const s = proxySessions[msg.callerTabId];
+      if (s && s.sessionId === msg.sessionId && s.ws.readyState === WebSocket.OPEN) {
+        s.ws.send(JSON.stringify({ event: 'finish' }));
       }
     }
 
     if (msg.type === 'PROXY_TTS_CLOSE') {
-      const ws = proxySessions[msg.callerTabId];
-      if (ws && ws.readyState === WebSocket.OPEN) ws.close(1000);
-      delete proxySessions[msg.callerTabId];
+      const s = proxySessions[msg.callerTabId];
+      if (s && s.sessionId === msg.sessionId) {
+        if (s.ws.readyState === WebSocket.OPEN) s.ws.close(1000);
+        delete proxySessions[msg.callerTabId];
+      }
     }
   });
 }

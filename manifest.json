@@ -3,7 +3,7 @@
   "name": "豆包 TTS",
   "version": "1.0",
   "description": "一键朗读当前网页内容,基于豆包流式 TTS",
-  "permissions": ["cookies", "storage"],
+  "permissions": ["cookies", "storage", "contextMenus"],
   "host_permissions": [
     "https://*.doubao.com/*",
     "wss://ws-samantha.doubao.com/*"
@@ -15,7 +15,8 @@
     {
       "matches": ["<all_urls>"],
       "js": ["content.js"],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "all_frames": true
     }
   ],
   "action": {
