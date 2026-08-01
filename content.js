@@ -52,6 +52,47 @@ let reconnectTimer = null;
 // WS open 看门狗:TTS_OPEN 后长时间没收到 open 事件(代理页异常/消息丢失)时给出可见提示
 let wsOpened = false;
 let openWatchdog = null;
+// 语速:speech_rate 取值 [-50,100],速度 = 1 + rate/100(服务端变速,不变调)
+const SPEED_OPTIONS = [[0, '1.0x'], [20, '1.2x'], [50, '1.5x'], [75, '1.75x'], [100, '2.0x']];
+let currentRate = 0;
+
+function rateLabel() {
+  return (SPEED_OPTIONS.find(([r]) => r === currentRate) || [])[1] || (currentRate / 100 + 1) + 'x';
+}
+
+// 读取持久化的语速选择
+try {
+  chrome.storage.local.get('ttsRate').then(({ ttsRate }) => {
+    if (typeof ttsRate === 'number') { currentRate = ttsRate; renderSpeedChips(); }
+  }).catch(() => {});
+} catch (e) {}
+
+function renderSpeedChips() {
+  const box = document.getElementById('tts-speeds');
+  if (!box) return;
+  box.innerHTML = '';
+  SPEED_OPTIONS.forEach(([rate, label]) => {
+    const b = document.createElement('span');
+    b.textContent = label;
+    b.style.cssText = 'flex:1;text-align:center;font-size:11px;padding:3px 0;border-radius:6px;cursor:pointer;user-select:none;'
+      + (rate === currentRate ? 'background:#f39c12;color:#1a1a1a;font-weight:bold;' : 'background:#2a2a2a;color:#888;');
+    b.onclick = () => setSpeed(rate);
+    box.appendChild(b);
+  });
+}
+
+function setSpeed(rate) {
+  if (rate === currentRate) return;
+  currentRate = rate;
+  try { chrome.storage.local.set({ ttsRate: rate }); } catch (e) {}
+  renderSpeedChips();
+  if (isReading) {
+    // 语速是建连参数,播放中切换 = 立即重开会话(不消耗重试配额),从当前句无缝接力
+    scheduleReconnect({ delay: 0, consumeRetry: false, status: `已切换 ${rateLabel()},切换中...` });
+  } else {
+    setStatus(`语速 ${rateLabel()}`, '#555');
+  }
+}
 
 function armOpenWatchdog() {
   clearTimeout(openWatchdog);
@@ -90,6 +131,7 @@ function injectPanel() {
       border-radius:10px; border:1px solid #444; background:transparent;
       color:#888; font-size:12px; cursor:pointer; outline:none;
     ">■ 停止</button>
+    <div id="tts-speeds" style="display:flex;gap:4px;margin-top:8px"></div>
     <div id="tts-ext-status" style="margin-top:10px;font-size:11px;color:#555;text-align:center">就绪</div>
     <div id="tts-ext-progress" style="margin-top:6px;font-size:11px;color:#555;text-align:center"></div>
   `;
@@ -100,6 +142,7 @@ function injectPanel() {
     stopRead();
     panel.remove();
   });
+  renderSpeedChips();
   initDrag();
 }
 
@@ -290,7 +333,7 @@ function startRead(text) {
   armOpenWatchdog();
   clearInterval(trickleTimer);
   trickleTimer = setInterval(() => pumpSegments(1), TRICKLE_INTERVAL_MS);
-  chrome.runtime.sendMessage({ type: 'TTS_OPEN', sessionId });
+  chrome.runtime.sendMessage({ type: 'TTS_OPEN', sessionId, rate: currentRate });
 }
 
 let pendingSegments = [];
@@ -314,7 +357,7 @@ function pumpSegments(forceCount = 0) {
     chrome.runtime.sendMessage({ type: 'TTS_SEND_TEXT', text: seg, sessionId });
     if (forceCount > 0) forceCount--;
   }
-  document.getElementById('tts-ext-progress').textContent = `发送 ${sendIndex}/${segmentTotal}`;
+  document.getElementById('tts-ext-progress').textContent = `发送 ${sendIndex}/${segmentTotal} · ${rateLabel()}`;
   if (sendIndex >= pendingSegments.length && !finishSent) {
     finishSent = true;
     chrome.runtime.sendMessage({ type: 'TTS_FINISH', sessionId });
@@ -378,18 +421,23 @@ function flushCurrentSentence() {
 }
 
 // 文本没发完连接就断了(或服务端提前 finish):服务端单会话限量/空闲判定,
-// 自动续连从断点接着发(缓冲队列跨会话连续)。旧 WS 由新 PROXY_TTS_OPEN 顺带关闭
-function scheduleReconnect() {
-  if (reconnects >= MAX_RECONNECTS) {
-    isReading = false;
-    isPaused = false;
-    clearInterval(trickleTimer);
-    setBtn('▶ 朗读本页');
-    setStopVisible(false);
-    setStatus(`服务端连续限量断开,续连失败 (${sendIndex}/${segmentTotal})`, '#e74c3c');
-    return;
+// 自动续连从断点接着发(缓冲队列跨会话连续)。旧 WS 由新 PROXY_TTS_OPEN 顺带关闭。
+// opts.consumeRetry=false:语速切换等主动换会话,不占重试配额;opts.delay 覆盖退避
+function scheduleReconnect(opts) {
+  const o = opts || {};
+  const consumeRetry = o.consumeRetry !== false;
+  if (consumeRetry) {
+    if (reconnects >= MAX_RECONNECTS) {
+      isReading = false;
+      isPaused = false;
+      clearInterval(trickleTimer);
+      setBtn('▶ 朗读本页');
+      setStopVisible(false);
+      setStatus(`服务端连续限量断开,续连失败 (${sendIndex}/${segmentTotal})`, '#e74c3c');
+      return;
+    }
+    reconnects++;
   }
-  reconnects++;
   wsClosed = false;
   wsOpened = false; // 旧会话已放弃:退避期间禁止任何发送(trickle 会每 10s 尝试)
   finishSent = false;
@@ -400,16 +448,16 @@ function scheduleReconnect() {
   sessionSeq += 1;
   sessionId = FRAME_UID + ':' + sessionSeq;
   // 退避:避免触发服务端频率限制,也给播放缓冲留出消耗时间
-  const delay = Math.min(800 * reconnects, 5000);
+  const delay = o.delay != null ? o.delay : Math.min(800 * reconnects, 5000);
   reconnectKick = 10; // 续连后首个 open 强制补发 10 段,绕过缓冲门限
-  setStatus(`服务端限量断开,${(delay / 1000).toFixed(1)}s 后续连 (${reconnects}) 从 ${sendIndex}/${segmentTotal} 继续...`, '#f39c12');
+  setStatus(o.status || `服务端限量断开,${(delay / 1000).toFixed(1)}s 后续连 (${reconnects}) 从 ${sendIndex}/${segmentTotal} 继续...`, '#f39c12');
   const sid = sessionId;
   clearTimeout(reconnectTimer);
   reconnectTimer = setTimeout(() => {
     if (!isReading || sessionId !== sid) return;
     wsOpened = false;
     armOpenWatchdog();
-    chrome.runtime.sendMessage({ type: 'TTS_OPEN', sessionId });
+    chrome.runtime.sendMessage({ type: 'TTS_OPEN', sessionId, rate: currentRate });
   }, delay);
 }
 
@@ -457,7 +505,7 @@ async function scheduleChunks(chunks) {
   };
 
   document.getElementById('tts-ext-progress').textContent =
-    `合成 ${sentenceCount} 句 · 排队 ${activeSources.length} · 缓冲 ${bufferedAhead().toFixed(2)}s`;
+    `合成 ${sentenceCount} 句 · 排队 ${activeSources.length} · 缓冲 ${bufferedAhead().toFixed(2)}s · ${rateLabel()}`;
 
   pumpSegments(); // 缓冲未满则继续送文本(首次合成前触发全量发送的起点)
 }
@@ -595,14 +643,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 // ── 豆包页:WS 代理 ───────────────────────────────
+// speech_rate 为建连参数(取值 [-50,100],速度=1+rate/100),由 caller 在 OPEN 时携带
 const TTS_URL = 'wss://ws-samantha.doubao.com/samantha/audio/tts'
   + '?speaker=zh_female_taozi_conversation_v4_wvae_bigtts'
-  + '&format=aac&speech_rate=0&pitch=0'
+  + '&format=aac&pitch=0'
   + '&version_code=20800&language=zh&device_platform=web'
   + '&aid=497858&real_aid=497858&pkg_type=release_version'
   + '&device_id=7616216604401780224&pc_version=3.15.1'
   + '&web_id=7627108056602248710&tea_uuid=7627108056602248710'
   + '&region=&sys_region=&samantha_web=1&use-olympus-account=1';
+
+function ttsUrl(rate) {
+  const r = Math.max(-50, Math.min(100, Math.round(rate || 0)));
+  return TTS_URL + '&speech_rate=' + r;
+}
 
 const proxySessions = {}; // callerTabId -> { ws, sessionId }
 
@@ -620,7 +674,7 @@ if (IS_DOUBAO && window === top) {
         try { old.ws.close(); } catch (e) {}
         delete proxySessions[callerTabId];
       }
-      const ws = new WebSocket(TTS_URL);
+      const ws = new WebSocket(ttsUrl(msg.rate));
       ws.binaryType = 'arraybuffer';
       proxySessions[callerTabId] = { ws, sessionId };
       const emit = (event, extra = {}) =>

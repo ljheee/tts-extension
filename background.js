@@ -98,7 +98,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       proxyMap[callerTabId] = { tabId: doubaoTab.id, sessionId: msg.sessionId };
       persistProxyMap();
-      chrome.tabs.sendMessage(doubaoTab.id, { type: 'PROXY_TTS_OPEN', callerTabId, sessionId: msg.sessionId });
+      chrome.tabs.sendMessage(doubaoTab.id, { type: 'PROXY_TTS_OPEN', callerTabId, sessionId: msg.sessionId, rate: msg.rate });
     });
     return false;
   }
