@@ -17,7 +17,6 @@ let isReading = false;
 let isPaused = false;
 let wsClosed = false;
 let segmentTotal = 0;
-let segmentSent = 0;
 let sentenceCount = 0;
 // 解码+调度串行链:保证句子严格按到达顺序上时间轴,消除乱序竞态
 let scheduleChain = Promise.resolve();
@@ -34,6 +33,12 @@ let sendIndex = 0;
 let sentencesPlayed = 0;
 let finishSent = false;
 let synthFinished = false; // 服务端 'finish' 事件:全部合成完毕(服务端可能不断开 WS)
+// 续发点定位:服务端会对文本流自行分句(可能合并/拆分我们的段),
+// 用句数对齐 sendIndex 必然漂移(偏少→重发旧文折返,偏多→跳句)。
+// 改用"服务端完成合成的字符数 → 段前缀和"映射,合并/拆分都不漂
+let segPrefixChars = []; // segPrefixChars[i] = 前 i 段总字符数
+let ackedChars = 0;      // 服务端已完整合成(sentence_end 入账)的字符数
+let pendingSentenceChars = 0; // sentence_start 预告、尚未 end 的句长
 // 会话代际:stop→start/续播时递增,旧会话迟到的 close/binary 事件一律丢弃,
 // 否则旧 close(1000) 会把新会话 wsClosed 置真,pump 永久停摆。
 // all_frames 下同 tab 多 frame 共享 callerTabId 路由,sessionId 必须带 frame 唯一前缀,
@@ -308,11 +313,14 @@ function startRead(text) {
   activeSources = [];
   sentenceCount = 0;
   segmentTotal = segs.length;
-  segmentSent = 0;
   sendIndex = 0;
   sentencesPlayed = 0;
   finishSent = false;
   synthFinished = false;
+  ackedChars = 0;
+  pendingSentenceChars = 0;
+  segPrefixChars = [0];
+  segs.forEach(s => segPrefixChars.push(segPrefixChars[segPrefixChars.length - 1] + s.length));
   scheduleChain = Promise.resolve();
   reconnects = 0;
   sessionSeq += 1;
@@ -330,6 +338,7 @@ function startRead(text) {
 
   pendingSegments = segs;
   wsOpened = false;
+  reconnectKick = 0;
   armOpenWatchdog();
   clearInterval(trickleTimer);
   trickleTimer = setInterval(() => pumpSegments(1), TRICKLE_INTERVAL_MS);
@@ -353,7 +362,6 @@ function pumpSegments(forceCount = 0) {
          && sendIndex - sentencesPlayed < SEND_AHEAD_SEGMENTS
          && (forceCount > 0 || bufferedAhead() <= SEND_AHEAD_SECONDS)) {
     const seg = pendingSegments[sendIndex++];
-    segmentSent = sendIndex;
     chrome.runtime.sendMessage({ type: 'TTS_SEND_TEXT', text: seg, sessionId });
     if (forceCount > 0) forceCount--;
   }
@@ -442,9 +450,20 @@ function scheduleReconnect(opts) {
   wsOpened = false; // 旧会话已放弃:退避期间禁止任何发送(trickle 会每 10s 尝试)
   finishSent = false;
   synthFinished = false;
-  // 回退发送指针到"已完整收到音频"的位置:已发送但音频未流完的句子必须重发,
-  // 否则每次限量断连漏读几句(宁可个别句重复,不可漏)
-  sendIndex = Math.min(sendIndex, sentenceCount);
+  // 半成品句丢弃(不入账不播放):否则新会话首句 binary 会与旧半截拼接,
+  // 轻则 decode 失败跳句,重则夹带残音;续发后整句重发
+  currentChunks = [];
+  pendingSentenceChars = 0;
+  // 按服务端"已完成合成"的字符数定位续发点(段前缀和映射),
+  // 不再用句数对齐:服务端自行分句,句数对齐会漂移(偏少→折返重发旧文,偏多→跳句)
+  let resumeIdx = 0;
+  while (resumeIdx < pendingSegments.length && segPrefixChars[resumeIdx + 1] <= ackedChars) resumeIdx++;
+  // 保守回退 1 段:readable_text 可能被服务端归一化展开(如数字"2024"→"二零二四")
+  // 虚增 ackedChars,极端情况下映射越过真实位置→跳段;宁可重读一段,不可跳句
+  sendIndex = Math.min(sendIndex, Math.max(0, resumeIdx - 1));
+  // 重发段的 sentence_start 会再次计入,先把基数重置为续发点的精确字符数
+  ackedChars = segPrefixChars[sendIndex];
+  pendingSentenceChars = 0;
   sessionSeq += 1;
   sessionId = FRAME_UID + ':' + sessionSeq;
   // 退避:避免触发服务端频率限制,也给播放缓冲留出消耗时间
@@ -543,18 +562,21 @@ chrome.runtime.onMessage.addListener((msg) => {
     } else if (payload.event === 'sentence_start') {
       reconnects = 0; // 新会话正常出活,续连计数清零
       const txt = payload.sentence_start_result?.readable_text || '';
+      pendingSentenceChars = txt.length; // 句长暂挂,sentence_end 才入账
       setStatus(`合成中: ${txt.slice(0, 40)}`, '#3498db');
     } else if (payload.event === 'sentence_end') {
+      ackedChars += pendingSentenceChars;
+      pendingSentenceChars = 0;
       flushCurrentSentence();
     } else if (payload.event === 'finish') {
-      flushCurrentSentence();
-      synthFinished = true;
-      // 文本没发完服务端就 finish:等同提前断连,直接续连(不等 close,可能不来)
+      // 文本没发完服务端就 finish:等同提前断连,直接续连(半成品清理由 scheduleReconnect 统一处理)
       if (sendIndex < pendingSegments.length) {
         console.log('[TTS] 服务端提前 finish,按断连续连处理, sent:', sendIndex, '/', segmentTotal);
         scheduleReconnect();
         return;
       }
+      flushCurrentSentence();
+      synthFinished = true;
       setStatus('全部合成完成', '#27ae60');
       // 调度链排空后若已无排队音频,立即收尾(服务端可能不关 WS)
       scheduleChain.then(maybeFinish);
@@ -573,21 +595,25 @@ chrome.runtime.onMessage.addListener((msg) => {
 
   if (msg.event === 'error') {
     setStatus('WS 错误', '#e74c3c');
+    // 丢弃半成品句:随后的 close 走非 premature 分支会 flush,不能把半截排上时间轴
+    currentChunks = [];
+    pendingSentenceChars = 0;
     isReading = false; isPaused = false; setBtn('▶ 朗读本页'); setStopVisible(false);
     return;
   }
 
   if (msg.event === 'close') {
     console.log('[TTS close] code:', msg.code, 'sent:', sendIndex, '/', segmentTotal, 'played sentences:', sentenceCount);
-    flushCurrentSentence();
     wsClosed = true;
     wsOpened = false;
 
-    // 文本没发完连接就断了:自动续连从断点接着发
+    // 文本没发完连接就断了:自动续连(半成品清理由 scheduleReconnect 统一处理)
     if (isReading && sendIndex < pendingSegments.length) {
       scheduleReconnect();
       return;
     }
+
+    flushCurrentSentence();
 
     if (msg.code === 1000) {
       // 正常关闭:等调度链排空后再判断,否则 in-flight 的 decode 会被误判为"已播完"
