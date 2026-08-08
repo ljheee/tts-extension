@@ -44,6 +44,12 @@ let normFull = '';       // 各段归一化文本的依序拼接(= 去空白全�
 let anchorPos = 0;       // normFull 中已确认合成到的位置(单调游标)
 let anchorDirty = false;
 let pendingSentenceText = '';
+let resumeTailText = ''; // 续连首投:当前段从 anchorPos 切开的尾巴(子段粒度续发,消除整段重读)
+// 高水位:历史最高已确认合成位置(归一化坐标,跨会话单调)。
+// 重连熔断按"上次重连后水位是否被推高"判定有无前进——原地打转的重连才计数,
+// 否则每次出流都清零计数,服务端持续中途断连时会无限重发同一段(单句循环)
+let highWaterNorm = 0;
+let lastReconnectHighWater = 0;
 // 会话代际:stop→start/续播时递增,旧会话迟到的 close/binary 事件一律丢弃,
 // 否则旧 close(1000) 会把新会话 wsClosed 置真,pump 永久停摆。
 // all_frames 下同 tab 多 frame 共享 callerTabId 路由,sessionId 必须带 frame 唯一前缀,
@@ -52,7 +58,7 @@ const FRAME_UID = Math.random().toString(36).slice(2) + Date.now().toString(36);
 let sessionSeq = 0;
 let sessionId = null;
 // 服务端对单会话文本量/时长有限制,可能中途关 WS;自动续连从断点接着发。
-// 收到新会话的 sentence/binary 说明续连成功,计数清零;连续失败才封顶
+// 续连计数只在"有前进"(高水位被推高)时清零,原地打转的续连到顶即停
 let reconnects = 0;
 const MAX_RECONNECTS = 8;
 // 续连后首个 open 必须立即补发文本(空会话会被服务端秒关),
@@ -213,6 +219,17 @@ function indexOfNormalized(haystack, needle) {
   return k < 0 ? -1 : map[k];
 }
 
+// 段内"去空白下标 → 原文下标"映射:续发点落在段中间时,从精确偏移切尾巴续发
+function rawIndexFromNorm(seg, normOffset) {
+  let seen = 0;
+  for (let i = 0; i < seg.length; i++) {
+    if (/\s/.test(seg[i])) continue;
+    if (seen === normOffset) return i;
+    seen++;
+  }
+  return seg.length;
+}
+
 // 断点续播:取选区起点到页面末尾的全部文本。
 // 主路径:活选区 Range 精确定位(不做字符串匹配);
 // 兜底:选区被预览插件重渲染销毁时,用右键点击瞬间捕获的 selectionText 在全文归一化匹配。
@@ -326,6 +343,9 @@ function startRead(text) {
   pendingSentenceText = '';
   anchorPos = 0;
   anchorDirty = false;
+  resumeTailText = '';
+  highWaterNorm = 0;
+  lastReconnectHighWater = 0;
   segPrefixChars = [0];
   normFull = '';
   segs.forEach(s => {
@@ -370,6 +390,11 @@ function bufferedAhead() {
 // 必须等 wsOpened:WS 未就绪时发送会被代理层静默丢弃,但 sendIndex 已前移,句子永久丢失
 function pumpSegments(forceCount = 0) {
   if (!isReading || wsClosed || !wsOpened) return;
+  // 续连首投:段内尾巴必须先于一切整段发送(文本顺序即合成顺序)
+  if (resumeTailText) {
+    chrome.runtime.sendMessage({ type: 'TTS_SEND_TEXT', text: resumeTailText, sessionId });
+    resumeTailText = '';
+  }
   while (sendIndex < pendingSegments.length
          && sendIndex - sentencesPlayed < SEND_AHEAD_SEGMENTS
          && (forceCount > 0 || bufferedAhead() <= SEND_AHEAD_SECONDS)) {
@@ -400,6 +425,7 @@ function stopRead() {
   scheduleChain = Promise.resolve();
   reconnects = 0;
   currentChunks = [];
+  resumeTailText = '';
   activeSources.forEach(s => { try { s.stop(); } catch (e) {} });
   activeSources = [];
   if (audioCtx) {
@@ -446,6 +472,12 @@ function flushCurrentSentence() {
 function scheduleReconnect(opts) {
   const o = opts || {};
   const consumeRetry = o.consumeRetry !== false;
+  // 熔断按"有无前进"计数:高水位被推高才清零重试,原地打转的重连一律计数。
+  // 不能看出流(sentence/binary)就清零——服务端持续中途断连时每次都有出流,
+  // 但续发点不前进,会无限重发同一段(单句循环)
+  const progressed = highWaterNorm > lastReconnectHighWater;
+  lastReconnectHighWater = highWaterNorm;
+  if (progressed) reconnects = 0;
   if (consumeRetry) {
     if (reconnects >= MAX_RECONNECTS) {
       isReading = false;
@@ -466,22 +498,30 @@ function scheduleReconnect(opts) {
   // 轻则 decode 失败跳句,重则夹带残音;续发后整句重发
   currentChunks = [];
   pendingSentenceText = '';
-  // 续发点定位:优先锚定游标(单调推进,免疫重复句与归一化漂移);
-  // 游标脏(服务端展开文本)时回退字符数映射并保守 -1 段(宁重复勿跳句)
-  let resumeIdx = -1;
+  // 续发点定位:干净路径用锚定游标精确到段内偏移——首投只发该段尾巴,
+  // 已合成句子零重发(消除折返重播),且段内进度可跨会话累积(消除原地打转);
+  // 脏路径(服务端展开文本,单位失真)回退段头对齐并保守 -1 段(宁重复勿跳句)
+  let resumeIdx = 0;
+  resumeTailText = '';
   if (!anchorDirty) {
-    resumeIdx = 0;
-    // 游标落在段中间(服务端拆句)→ 指向该段头,重读至多半句,不跳句
     while (resumeIdx < pendingSegments.length && segPrefixChars[resumeIdx + 1] <= anchorPos) resumeIdx++;
+    const normOffset = anchorPos - segPrefixChars[resumeIdx];
+    if (resumeIdx < pendingSegments.length && normOffset > 0) {
+      resumeTailText = pendingSegments[resumeIdx].slice(rawIndexFromNorm(pendingSegments[resumeIdx], normOffset));
+      sendIndex = Math.min(sendIndex, resumeIdx + 1); // 尾巴覆盖了该段,整段从下一段发起
+    } else {
+      sendIndex = Math.min(sendIndex, resumeIdx);
+    }
+    ackedChars = anchorPos; // 同坐标对齐,后续若转脏,兜底基数精确
   } else {
-    resumeIdx = 0;
     while (resumeIdx < pendingSegments.length && segPrefixChars[resumeIdx + 1] <= ackedChars) resumeIdx++;
     resumeIdx = Math.max(0, resumeIdx - 1);
+    sendIndex = Math.min(sendIndex, resumeIdx);
+    anchorPos = segPrefixChars[sendIndex]; // 续发段头是已知好锚,游标就地重新自证
+    ackedChars = anchorPos;
   }
-  sendIndex = Math.min(sendIndex, resumeIdx);
-  // 重发段的 sentence_start 会再次计入,基数与游标都重置为续发点精确值
-  ackedChars = segPrefixChars[sendIndex];
-  anchorPos = segPrefixChars[sendIndex];
+  // 重发段的 sentence_start 会再次计入;脏标记每会话清零,给锚点重新自证的机会
+  anchorDirty = false;
   sessionSeq += 1;
   sessionId = FRAME_UID + ':' + sessionSeq;
   // 退避:避免触发服务端频率限制,也给播放缓冲留出消耗时间
@@ -578,7 +618,6 @@ chrome.runtime.onMessage.addListener((msg) => {
     if (payload.event === 'open_success') {
       // 服务端 ack,不做特别处理
     } else if (payload.event === 'sentence_start') {
-      reconnects = 0; // 新会话正常出活,续连计数清零
       const txt = payload.sentence_start_result?.readable_text || '';
       pendingSentenceText = txt; // sentence_end 时入账并推进锚定游标
       setStatus(`合成中: ${txt.slice(0, 40)}`, '#3498db');
@@ -593,6 +632,8 @@ chrome.runtime.onMessage.addListener((msg) => {
         if (k >= 0 && k - anchorPos <= 50) anchorPos = k + norm.length;
         else anchorDirty = true;
       }
+      // 高水位只增不减:重连熔断按"水位是否被推高"判定本轮会话有无前进
+      highWaterNorm = Math.max(highWaterNorm, anchorPos, Math.min(ackedChars, normFull.length));
       flushCurrentSentence();
     } else if (payload.event === 'finish') {
       // 文本没发完服务端就 finish:等同提前断连,直接续连(半成品清理由 scheduleReconnect 统一处理)
@@ -613,7 +654,6 @@ chrome.runtime.onMessage.addListener((msg) => {
   }
 
   if (msg.event === 'binary') {
-    reconnects = 0; // 新会话正常出流,续连计数清零
     currentChunks.push(msg.data);
     console.log('[TTS binary]', msg.data.length, 'bytes, sentence chunks:', currentChunks.length);
     return;
